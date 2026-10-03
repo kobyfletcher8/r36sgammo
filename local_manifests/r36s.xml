@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+    <remote name="andr36oid" fetch="https://github.com/andr36oid/" />
+
+    <project name="android_device_gameconsole_common"
+             path="device/gameconsole/common"
+             remote="andr36oid"
+             revision="lineage-18.1" />
+
+    <project name="android_device_gameconsole_r36s"
+             path="device/gameconsole/r36s"
+             remote="andr36oid"
+             revision="lineage-18.1" />
+
+    <project name="android_kernel_gameconsole_r36s"
+             path="kernel/gameconsole/r36s"
+             remote="andr36oid"
+             revision="lineage-18.1" />
+</manifest>
