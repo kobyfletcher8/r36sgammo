@@ -1,0 +1,284 @@
+name: GammaOS Core R36S RK3326 (large-disk build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gamma_ref:
+        description: 'GammaOSCoreDistribution branch or commit'
+        required: true
+        default: develop
+        type: string
+      r36s_ref:
+        description: 'R36S device/common/kernel branch or commit'
+        required: true
+        default: lineage-18.1
+        type: string
+      runner_label:
+        description: 'GitHub-hosted/self-hosted runner label. Full Android build needs substantially more than the 14 GB standard runner.'
+        required: true
+        default: ubuntu-24.04-16core
+        type: string
+      build_images:
+        description: 'Build systemimage and bootimage after the gates'
+        required: true
+        default: true
+        type: boolean
+      jobs:
+        description: 'Parallel build jobs'
+        required: true
+        default: '8'
+        type: string
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+      - 'device/**'
+      - 'local_manifests/**'
+      - 'scripts/**'
+      - 'patches/**'
+      - 'docs/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+env:
+  GAMMA_REPO: https://github.com/TheGammaSqueeze/GammaOSCoreDistribution.git
+  R36S_COMMON_REPO: https://github.com/andr36oid/android_device_gameconsole_common.git
+  R36S_DEVICE_REPO: https://github.com/andr36oid/android_device_gameconsole_r36s.git
+  R36S_KERNEL_REPO: https://github.com/andr36oid/android_kernel_gameconsole_r36s.git
+  ANDROID_JAVA_VERSION: '17'
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_label || 'ubuntu-24.04-16core' }}
+    timeout-minutes: 720
+
+    steps:
+      - name: Checkout port kit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure Git for large source checkout
+        run: |
+          set -euxo pipefail
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config --global protocol.version 2
+          git config --global core.compression 0
+          git config --global core.preloadIndex true
+
+      - name: Inspect runner capacity before checkout
+        run: |
+          set -euo pipefail
+          echo '=== runner ==='
+          uname -a
+          nproc
+          free -h
+          echo '=== storage ==='
+          df -hT
+          ROOT_AVAIL_GB=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "Root filesystem available: ${ROOT_AVAIL_GB} GB"
+          if [ "${ROOT_AVAIL_GB:-0}" -lt 50 ]; then
+            echo 'ERROR: less than 50 GB free before Android source checkout.'
+            echo 'Use a GitHub larger runner (for example a 150/300/600 GB Ubuntu runner) or a self-hosted runner.'
+            exit 1
+          fi
+
+      - name: Free preinstalled disk space
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/powershell 2>/dev/null || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -hT
+
+      - name: Install Android/AOSP host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++ git gnupg gperf \
+            imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev \
+            libelf-dev liblz4-tool libncurses-dev libssl-dev libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools unzip xsltproc zip \
+            zlib1g-dev python3 python3-venv python3-pip file lsof jq \
+            openssh-client rsync
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create build workspace
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/work" "$GITHUB_WORKSPACE/artifacts/logs"
+          echo "WORKTREE=$GITHUB_WORKSPACE/work/gammaos-r36s" >> "$GITHUB_ENV"
+          echo "PORT_KIT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          echo "BUILD_JOBS=${{ inputs.jobs || '8' }}" >> "$GITHUB_ENV"
+          df -hT
+
+      - name: Fetch GammaOS Core with partial + sparse clone
+        run: |
+          set -euxo pipefail
+          REF='${{ inputs.gamma_ref || 'develop' }}'
+          rm -rf "$WORKTREE"
+
+          # GammaOSCoreDistribution is a monolithic Android source snapshot and also
+          # tracks .repo/ and out/. A normal clone/check-out wastes runner storage on
+          # those trees. blob:none + sparse checkout avoids materialising them.
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --no-checkout \
+            --single-branch \
+            --branch "$REF" \
+            "$GAMMA_REPO" "$WORKTREE"
+
+          cd "$WORKTREE"
+          git sparse-checkout init --no-cone
+          git sparse-checkout set --no-cone '/*' '!/.repo/' '!/out/'
+          git checkout --detach HEAD
+
+          echo '=== GammaOS revision ==='
+          git rev-parse HEAD
+          echo '=== Sparse checkout ==='
+          git sparse-checkout reapply
+          git sparse-checkout list || true
+          test ! -d .repo
+          test ! -d out
+          test -f build/envsetup.sh
+          df -hT
+
+      - name: Fetch R36S hardware sources shallowly
+        run: |
+          set -euxo pipefail
+          cd "$WORKTREE"
+          mkdir -p device/gameconsole kernel/gameconsole
+
+          git clone --depth=1 --single-branch --branch '${{ inputs.r36s_ref || 'lineage-18.1' }}' \
+            "$R36S_COMMON_REPO" device/gameconsole/common
+          git clone --depth=1 --single-branch --branch '${{ inputs.r36s_ref || 'lineage-18.1' }}' \
+            "$R36S_DEVICE_REPO" device/gameconsole/r36s
+          git clone --depth=1 --single-branch --branch '${{ inputs.r36s_ref || 'lineage-18.1' }}' \
+            "$R36S_KERNEL_REPO" kernel/gameconsole/r36s
+
+          echo '=== hardware revisions ==='
+          printf 'common: '; git -C device/gameconsole/common rev-parse HEAD
+          printf 'device: '; git -C device/gameconsole/r36s rev-parse HEAD
+          printf 'kernel: '; git -C kernel/gameconsole/r36s rev-parse HEAD
+          df -hT
+
+      - name: Install R36S GammaOS product overlay
+        run: |
+          set -euxo pipefail
+          "$PORT_KIT/scripts/apply_r36s_overlay.sh" "$WORKTREE"
+          test -f "$WORKTREE/device/gamma/r36s/AndroidProducts.mk"
+          test -f "$WORKTREE/device/gamma/r36s/gammaos_r36s.mk"
+          test -f "$WORKTREE/device/gamma/r36s/BoardConfig.mk"
+
+      - name: Audit Android 13 / RK3326 compatibility
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cd "$WORKTREE"
+          "$PORT_KIT/scripts/audit_android13.sh" . | tee "$GITHUB_WORKSPACE/artifacts/android13-audit.txt"
+          echo '== RK3566/RK3568 references in R36S product glue =='
+          if grep -RInE 'rk3566|rk3568' device/gamma/r36s 2>/dev/null; then
+            echo 'ERROR: RK3566/RK3568 reference found in R36S product glue.'
+            exit 1
+          fi
+
+      - name: Product parse gate
+        run: |
+          set -euxo pipefail
+          cd "$WORKTREE"
+          source build/envsetup.sh
+          lunch gammaos_r36s-userdebug
+          get_build_var TARGET_PRODUCT
+          get_build_var TARGET_ARCH
+          get_build_var TARGET_ARCH_VARIANT
+          get_build_var TARGET_CPU_VARIANT
+          get_build_var TARGET_BOARD_PLATFORM
+          get_build_var TARGET_SOC
+
+      - name: Bootstrap Soong (m nothing)
+        run: |
+          set -o pipefail
+          cd "$WORKTREE"
+          source build/envsetup.sh
+          lunch gammaos_r36s-userdebug
+          set +e
+          m nothing -j"$BUILD_JOBS" 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/logs/m-nothing.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            "$PORT_KIT/scripts/collect_failure.sh" "$WORKTREE" || true
+            exit "$rc"
+          fi
+
+      - name: Build Android images
+        if: ${{ inputs.build_images != false }}
+        run: |
+          set -o pipefail
+          cd "$WORKTREE"
+          source build/envsetup.sh
+          lunch gammaos_r36s-userdebug
+          set +e
+          {
+            echo '===== systemimage ====='
+            m systemimage -j"$BUILD_JOBS"
+            rc1=$?
+            echo "systemimage rc=$rc1"
+            if [ "$rc1" -eq 0 ]; then
+              echo '===== bootimage ====='
+              m bootimage -j"$BUILD_JOBS"
+              rc2=$?
+            else
+              rc2=0
+            fi
+            echo "bootimage rc=$rc2"
+            test "$rc1" -eq 0 && test "$rc2" -eq 0
+          } 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/logs/images.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            "$PORT_KIT/scripts/collect_failure.sh" "$WORKTREE" || true
+            exit "$rc"
+          fi
+
+      - name: Collect build outputs and disk usage
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="$WORKTREE/out/target/product/r36s"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/r36s-output"
+          if [ -d "$OUT" ]; then
+            ls -lah "$OUT" | tee "$GITHUB_WORKSPACE/artifacts/r36s-output/listing.txt"
+            find "$OUT" -maxdepth 1 -type f \( -name '*.img' -o -name '*.zip' -o -name '*.dtb' -o -name '*.json' \) -print0 |
+              while IFS= read -r -d '' f; do cp -f "$f" "$GITHUB_WORKSPACE/artifacts/r36s-output/"; done
+          fi
+          du -sh "$WORKTREE" 2>/dev/null | tee "$GITHUB_WORKSPACE/artifacts/source-size.txt" || true
+          df -hT | tee "$GITHUB_WORKSPACE/artifacts/disk-usage.txt"
+
+      - name: Collect failure diagnostics
+        if: failure() || cancelled()
+        run: |
+          set +e
+          "$PORT_KIT/scripts/collect_failure.sh" "$WORKTREE" 2>/dev/null || true
+          find "$WORKTREE" -maxdepth 4 -type f \
+            \( -name '*.log' -o -name 'error.log' -o -name 'soong.log' \) \
+            -print 2>/dev/null | head -n 200 > "$GITHUB_WORKSPACE/artifacts/failure-files.txt" || true
+
+      - name: Upload diagnostics and outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gammaos-r36s-build-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
